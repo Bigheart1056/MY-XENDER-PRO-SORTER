@@ -12,7 +12,7 @@ st.set_page_config(
 st.title('📧 Lead Email Provider & Pre-Bounce Sorter')
 st.write(
     'Sort B2B providers, detect security gateways, catch typos/parked domains,'
-    ' and score bounce risk—100% free without API keys.'
+    ' and score bounce risk.'
 )
 
 FREE_DOMAINS = {
@@ -36,7 +36,6 @@ FREE_DOMAINS = {
     'gmx.com',
     'mail.com',
 }
-
 DISPOSABLE_DOMAINS = {
     'mailinator.com',
     'temp-mail.org',
@@ -52,7 +51,6 @@ DISPOSABLE_DOMAINS = {
     'dispostable.com',
     'maildrop.cc',
 }
-
 TYPO_DOMAINS = {
     'gnail.com',
     'gmal.com',
@@ -74,8 +72,7 @@ TYPO_DOMAINS = {
     'iclod.com',
     'icoud.com',
 }
-
-PARKED_MX_KEYWORDS = {
+PARKED_KEYWORDS = {
     'parking',
     'sedoparking',
     'bodis',
@@ -86,7 +83,6 @@ PARKED_MX_KEYWORDS = {
     'uniregistry',
     'localhost',
 }
-
 ROLE_PREFIXES = {
     'info',
     'sales',
@@ -112,25 +108,22 @@ ROLE_PREFIXES = {
     'enquiries',
     'inquiries',
 }
-
 EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
 
 
 def is_valid_syntax(email):
-  email = str(email).strip().lower()
-  if not email or '..' in email or ' ' in email:
-    return False
-  return bool(EMAIL_REGEX.match(email))
+  e = str(email).strip().lower()
+  return bool(e and '..' not in e and ' ' not in e and EMAIL_REGEX.match(e))
 
 
-def detect_gateway(mx_string):
-  if 'mimecast' in mx_string:
+def detect_gateway(mx):
+  if 'mimecast' in mx:
     return 'Mimecast'
-  elif 'pphosted' in mx_string or 'proofpoint' in mx_string:
+  if 'pphosted' in mx or 'proofpoint' in mx:
     return 'Proofpoint'
-  elif 'barracuda' in mx_string:
+  if 'barracuda' in mx:
     return 'Barracuda'
-  elif 'iphmx' in mx_string or 'cisco' in mx_string:
+  if 'iphmx' in mx or 'cisco' in mx:
     return 'Cisco IronPort'
   return 'None'
 
@@ -138,103 +131,79 @@ def detect_gateway(mx_string):
 def analyze_domain(domain):
   if not domain or '.' not in domain:
     return ('Invalid / Syntax Error', 'None', 'Hard Bounce (Syntax)')
-
   if domain in TYPO_DOMAINS:
     return ('Invalid / Typo Domain', 'None', 'Hard Bounce (Domain Typo)')
-
   if domain in DISPOSABLE_DOMAINS:
     return ('Disposable / Burner', 'None', 'Hard Bounce (Disposable)')
-
   if domain in FREE_DOMAINS:
     return ('Personal / Free Email', 'None', 'Low Risk (Consumer)')
 
   try:
     mx_records = dns.resolver.resolve(domain, 'MX', lifetime=3)
     mx_hosts = [str(r.exchange).lower().rstrip('.') for r in mx_records]
-    mx_string = ' '.join(mx_hosts)
+    mx_str = ' '.join(mx_hosts)
 
-    # Check Null MX (RFC 7505: domain explicitly accepts no email)
     if not mx_hosts or mx_hosts == [''] or mx_hosts == ['.']:
       return ('Invalid / No MX', 'None', 'Hard Bounce (Null MX)')
-
-    # Check Parked Domains
-    if any(kw in mx_string for kw in PARKED_MX_KEYWORDS):
+    if any(kw in mx_str for kw in PARKED_KEYWORDS):
       return ('Invalid / Parked Domain', 'None', 'Hard Bounce (Parked)')
 
-    gateway = detect_gateway(mx_string)
+    gw = detect_gateway(mx_str)
+    if 'google.com' in mx_str or 'googlemail.com' in mx_str:
+      return ('Google Workspace', gw, 'Safe / Valid MX')
+    if 'outlook.com' in mx_str:
+      return ('Microsoft 365', gw, 'Medium Risk (Catch-All Possible)')
 
-    if 'google.com' in mx_string or 'googlemail.com' in mx_string:
-      return ('Google Workspace', gateway, 'Safe / Valid MX')
-    elif 'outlook.com' in mx_string:
-      return ('Microsoft 365', gateway, 'Medium Risk (Catch-All Possible)')
-
-    # Fallback: Check SPF (TXT) records
-    txt_string = ''
+    txt_str = ''
     try:
       txt_records = dns.resolver.resolve(domain, 'TXT', lifetime=3)
-      txt_string = ' '.join([str(r).lower() for r in txt_records])
+      txt_str = ' '.join([str(r).lower() for r in txt_records])
     except Exception:
       pass
 
-    # Check if domain strictly sends/receives zero email ("v=spf1 -all")
-    if '"v=spf1 -all"' in txt_string or "'v=spf1 -all'" in txt_string:
+    if '"v=spf1 -all"' in txt_str or "'v=spf1 -all'" in txt_str:
       return ('Invalid / Non-Sending Domain', 'None', 'Hard Bounce (SPF -all)')
+    if '_://google.com' in txt_str:
+      return ('Google Workspace', gw, 'Safe / Valid MX')
+    if '://outlook.com' in txt_str:
+      return ('Microsoft 365', gw, 'Medium Risk (Catch-All Possible)')
 
-    if '_://google.com' in txt_string:
-      return ('Google Workspace', gateway, 'Safe / Valid MX')
-    elif '://outlook.com' in txt_string:
-      return ('Microsoft 365', gateway, 'Medium Risk (Catch-All Possible)')
-
-    return ('Other', gateway, 'Safe / Valid MX')
+    return ('Other', gw, 'Safe / Valid MX')
   except Exception:
     return ('Invalid / No MX', 'None', 'Hard Bounce (Dead Domain)')
 
 
-def get_prefix_risk(email, base_risk):
-  if 'Hard Bounce' in base_risk:
-    return base_risk
-  try:
-    local = str(email).split('@').strip().lower()
-    clean_local = re.split(r'[._\-0-9]+', local)
-    if local in ROLE_PREFIXES or clean_local in ROLE_PREFIXES:
-      return 'High Risk (Role / Generic Address)'
-    return base_risk
-  except Exception:
-    return base_risk
-
-
-def extract_first_name(email):
-  try:
-    if not is_valid_syntax(email):
-      return ''
-    local = str(email).split('@').strip().lower()
-    parts = re.split(r'[._\-0-9]+', local)
-    first_part = parts if parts else ''
-    if (
-        len(parts) >= 2
-        and len(first_part) >= 2
-        and first_part not in ROLE_PREFIXES
-    ):
-      return first_part.capitalize()
-    return ''
-  except Exception:
-    return ''
+def parse_email_parts(email, base_risk):
+  if not is_valid_syntax(email):
+    return (base_risk, '')
+  local, _ = str(email).strip().lower().split('@', 1)
+  parts = re.split(r'[._\-0-9]+', local)
+  first = next((p for p in parts if p), '')
+  risk = (
+      'High Risk (Role / Generic Address)'
+      if (local in ROLE_PREFIXES or first in ROLE_PREFIXES)
+      and 'Hard Bounce' not in base_risk
+      else base_risk
+  )
+  fname = (
+      first.capitalize()
+      if (len(parts) >= 2 and len(first) >= 2 and first not in ROLE_PREFIXES)
+      else ''
+  )
+  return (risk, fname)
 
 
 def extract_company(domain):
-  try:
-    if (
-        not domain
-        or domain in FREE_DOMAINS
-        or domain in DISPOSABLE_DOMAINS
-        or domain in TYPO_DOMAINS
-        or '.' not in domain
-    ):
-      return ''
-    name = domain.split('.')
-    return name.replace('-', ' ').title()
-  except Exception:
+  if (
+      not domain
+      or domain in FREE_DOMAINS
+      or domain in DISPOSABLE_DOMAINS
+      or domain in TYPO_DOMAINS
+      or '.' not in domain
+  ):
     return ''
+  main_part, _ = domain.split('.', 1)
+  return main_part.replace('-', ' ').title()
 
 
 if 'sorted_df' not in st.session_state:
@@ -265,95 +234,114 @@ if uploaded_file is not None:
         (i for i, col in enumerate(raw_df.columns) if 'email' in col.lower()), 0
     )
     email_col = st.selectbox(
-        'Select which column contains your email addresses:',
-        raw_df.columns,
-        index=default_idx,
+        'Select email column:', raw_df.columns, index=default_idx
     )
 
   if st.button('Clean, Sort & Score Bounce Risk', type='primary'):
     with st.spinner(
-        'Running syntax, typo, parked domain, MX/SPF, and role-address'
-        ' checks...'
+        'Checking syntax, typos, parked domains, MX/SPF, and role addresses...'
     ):
       df = raw_df.copy()
       df[email_col] = df[email_col].astype(str).str.strip()
       df = df.drop_duplicates(subset=[email_col]).copy()
 
-      df['_valid_syntax'] = df[email_col].apply(is_valid_syntax)
+      df['_valid'] = df[email_col].apply(is_valid_syntax)
       df['_domain'] = df.apply(
-          lambda row: row[email_col].split('@')[-1].lower()
-          if row['_valid_syntax']
+          lambda r: r[email_col].split('@', 1)[-1].lower()
+          if r['_valid']
           else '',
           axis=1,
       )
-
       unique_domains = [d for d in df['_domain'].unique() if d]
 
-      with ThreadPoolExecutor(max_workers=25) as executor:
-        domain_results = dict(
-            zip(unique_domains, executor.map(analyze_domain, unique_domains))
+      with ThreadPoolExecutor(max_workers=25) as ex:
+        dom_map = dict(
+            zip(unique_domains, ex.map(analyze_domain, unique_domains))
         )
 
-      def map_results(row):
-        if not row['_valid_syntax']:
-          return ('Invalid / Syntax Error', 'None', 'Hard Bounce (Syntax)')
-        return domain_results.get(
-            row['_domain'],
-            ('Invalid / No MX', 'None', 'Hard Bounce (Dead Domain)'),
-        )
+      providers, gateways, base_risks = [], [], []
+      for valid, dom in zip(df['_valid'], df['_domain']):
+        if not valid:
+          p, g, r = ('Invalid / Syntax Error', 'None', 'Hard Bounce (Syntax)')
+        else:
+          p, g, r = dom_map.get(
+              dom, ('Invalid / No MX', 'None', 'Hard Bounce (Dead Domain)')
+          )
+        providers.append(p)
+        gateways.append(g)
+        base_risks.append(r)
 
-      mapped = df.apply(map_results, axis=1)
-      df['Provider'] = [m for m in mapped]
-      df['Security_Gateway'] = [m for m in mapped]
-      base_risks = [m for m in mapped]
+      final_risks, first_names = [], []
+      for email, br in zip(df[email_col], base_risks):
+        fr, fn = parse_email_parts(email, br)
+        final_risks.append(fr)
+        first_names.append(fn)
 
-      df['Bounce_Risk'] = [
-          get_prefix_risk(email, risk)
-          for email, risk in zip(df[email_col], base_risks)
-      ]
-      df['Extracted_First_Name'] = df[email_col].apply(extract_first_name)
+      df['Provider'] = providers
+      df['Security_Gateway'] = gateways
+      df['Bounce_Risk'] = final_risks
+      df['Extracted_First_Name'] = first_names
       df['Extracted_Company'] = df['_domain'].apply(extract_company)
-
-      df.drop(columns=['_valid_syntax', '_domain'], inplace=True)
+      df.drop(columns=['_valid', '_domain'], inplace=True)
       st.session_state.sorted_df = df
 
 if st.session_state.sorted_df is not None:
   df = st.session_state.sorted_df
   st.success(f'Done! Processed {len(df):,} unique rows.')
-
   counts = df['Provider'].value_counts()
+
   st.subheader('Clean Leads Breakdown')
-  col1, col2, col3, col4 = st.columns(4)
-  col1.metric('Google Workspace', counts.get('Google Workspace', 0))
-  col2.metric('Microsoft 365', counts.get('Microsoft 365', 0))
-  col3.metric('Personal / Free', counts.get('Personal / Free Email', 0))
-  col4.metric('Other B2B', counts.get('Other', 0))
+  c1, c2, c3, c4 = st.columns(4)
+  c1.metric('Google Workspace', counts.get('Google Workspace', 0))
+  c2.metric('Microsoft 365', counts.get('Microsoft 365', 0))
+  c3.metric('Personal / Free', counts.get('Personal / Free Email', 0))
+  c4.metric('Other B2B', counts.get('Other', 0))
 
   st.subheader('Pre-Bounce & Risk Breakdown')
-  r_col1, r_col2, r_col3, r_col4 = st.columns(4)
+  r1, r2, r3, r4 = st.columns(4)
   hard_bounces = df[df['Bounce_Risk'].str.startswith('Hard Bounce')]
   role_risks = df[df['Bounce_Risk'].str.startswith('High Risk')]
-  r_col1.metric(
-      'Hard Bounces Caught',
-      len(hard_bounces),
-      help='Dead domains, typos, parked domains, disposable, syntax errors',
-  )
-  r_col2.metric(
-      'Role / Generic Risk',
-      len(role_risks),
-      help='info@, sales@, admin@, support@, etc.',
-  )
-  r_col3.metric('Domain Typos Caught', counts.get('Invalid / Typo Domain', 0))
-  r_col4.metric(
+  r1.metric('Hard Bounces Caught', len(hard_bounces))
+  r2.metric('Role / Generic Risk', len(role_risks))
+  r3.metric('Domain Typos Caught', counts.get('Invalid / Typo Domain', 0))
+  r4.metric(
       'Parked / Dead Domains',
       counts.get('Invalid / No MX', 0)
       + counts.get('Invalid / Parked Domain', 0),
   )
-
+    
   st.subheader('Download Your Segmented Lists')
-  f_col1, f_col2 = st.columns(2)
-  with f_col1:
-    exclude_gateways = st.checkbox(
-        'Exclude Mimecast / Proofpoint / Barracuda from Google & Microsoft'
-        ' downloads',
-        value=False,
+  f1, f2 = st.columns(2)
+  exclude_gw = f1.checkbox(
+      'Exclude Mimecast / Proofpoint / Barracuda from Google & Microsoft'
+      ' downloads',
+      value=False,
+  )
+  exclude_roles = f2.checkbox(
+      'Exclude Role/Generic addresses (info@, sales@, admin@) from Google &'
+      ' Microsoft downloads',
+      value=True,
+  )
+
+  g_df = df[df['Provider'] == 'Google Workspace']
+  m_df = df[df['Provider'] == 'Microsoft 365']
+  if exclude_gw:
+    g_df = g_df[g_df['Security_Gateway'] == 'None']
+    m_df = m_df[m_df['Security_Gateway'] == 'None']
+  if exclude_roles:
+    g_df = g_df[~g_df['Bounce_Risk'].str.startswith('High Risk')]
+    m_df = m_df[~m_df['Bounce_Risk'].str.startswith('High Risk')]
+
+  p_df = df[df['Provider'] == 'Personal / Free Email']
+  o_df = df[df['Provider'] == 'Other']
+
+  d1, d2, d3, d4, d5, d6 = st.columns(6)
+  d1.download_button(
+      '⬇️ All Rows',
+      df.to_csv(index=False).encode('utf-8'),
+      'all_processed_leads.csv',
+      'text/csv',
+      key='dl_all',
+  )
+  d2.download_button(
+      f'⬇️ Google ({len(g_df)})',
