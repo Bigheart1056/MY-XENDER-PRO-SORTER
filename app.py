@@ -158,41 +158,47 @@ def extract_company(domain):
     return ''
 
 
+# Initialize session state storage
+if 'sorted_df' not in st.session_state:
+  st.session_state.sorted_df = None
+if 'last_file_id' not in st.session_state:
+  st.session_state.last_file_id = None
+
 uploaded_file = st.file_uploader(
     'Upload your leads file (CSV or TXT)', type=['csv', 'txt']
 )
 
 if uploaded_file is not None:
+  # Clear saved results if user uploads a brand new file
+  file_id = f'{uploaded_file.name}_{uploaded_file.size}'
+  if st.session_state.last_file_id != file_id:
+    st.session_state.sorted_df = None
+    st.session_state.last_file_id = file_id
+
   if uploaded_file.name.lower().endswith('.txt'):
     lines = [
         line.decode('utf-8', errors='ignore').strip()
         for line in uploaded_file.readlines()
     ]
-    df = pd.DataFrame({'email': [l for l in lines if l]})
+    raw_df = pd.DataFrame({'email': [l for l in lines if l]})
     email_col = 'email'
   else:
-    df = pd.read_csv(uploaded_file)
+    raw_df = pd.read_csv(uploaded_file)
     default_idx = next(
-        (i for i, col in enumerate(df.columns) if 'email' in col.lower()), 0
+        (i for i, col in enumerate(raw_df.columns) if 'email' in col.lower()), 0
     )
     email_col = st.selectbox(
         'Select which column contains your email addresses:',
-        df.columns,
+        raw_df.columns,
         index=default_idx,
     )
 
-  exclude_gateways = st.checkbox(
-      'Exclude Mimecast / Proofpoint / Barracuda leads from Google & Microsoft'
-      ' download files',
-      value=False,
-  )
-
   if st.button('Clean, Sort & Enrich Leads', type='primary'):
     with st.spinner('Cleaning syntax, checking MX/SPF, and extracting info...'):
+      df = raw_df.copy()
       df[email_col] = df[email_col].astype(str).str.strip()
       df = df.drop_duplicates(subset=[email_col]).copy()
 
-      # Check syntax first
       df['_valid_syntax'] = df[email_col].apply(is_valid_syntax)
       df['_domain'] = df.apply(
           lambda row: row[email_col].split('@')[-1].lower()
@@ -225,106 +231,118 @@ if uploaded_file is not None:
 
       df.drop(columns=['_valid_syntax', '_domain'], inplace=True)
 
-    st.success(f'Done! Processed {len(df):,} unique rows.')
+      # Save sorted dataframe in memory so downloads don't wipe it
+      st.session_state.sorted_df = df
 
-    # Row 1: Clean Provider Metrics
-    counts = df['Provider'].value_counts()
-    st.subheader('Clean Leads Breakdown')
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric('Google Workspace', counts.get('Google Workspace', 0))
-    col2.metric('Microsoft 365', counts.get('Microsoft 365', 0))
-    col3.metric('Personal / Free', counts.get('Personal / Free Email', 0))
-    col4.metric('Other B2B', counts.get('Other', 0))
+# Display results from session_state so they stay visible across multiple downloads
+if st.session_state.sorted_df is not None:
+  df = st.session_state.sorted_df
+  st.success(f'Done! Processed {len(df):,} unique rows.')
 
-    # Row 2: Explicit Invalid & Syntax Metrics
-    st.subheader('Removed / Invalid Breakdown')
-    inv_col1, inv_col2, inv_col3 = st.columns(3)
-    inv_col1.metric(
-        'Invalid / Syntax Error', counts.get('Invalid / Syntax Error', 0)
-    )
-    inv_col2.metric('Invalid / No MX', counts.get('Invalid / No MX', 0))
-    inv_col3.metric(
-        'Disposable / Burner', counts.get('Disposable / Burner', 0)
-    )
+  counts = df['Provider'].value_counts()
+  st.subheader('Clean Leads Breakdown')
+  col1, col2, col3, col4 = st.columns(4)
+  col1.metric('Google Workspace', counts.get('Google Workspace', 0))
+  col2.metric('Microsoft 365', counts.get('Microsoft 365', 0))
+  col3.metric('Personal / Free', counts.get('Personal / Free Email', 0))
+  col4.metric('Other B2B', counts.get('Other', 0))
 
-    # Download Section
-    st.subheader('Download Your Segmented Lists')
-    d_col1, d_col2, d_col3, d_col4, d_col5, d_col6 = st.columns(6)
+  st.subheader('Removed / Invalid Breakdown')
+  inv_col1, inv_col2, inv_col3 = st.columns(3)
+  inv_col1.metric(
+      'Invalid / Syntax Error', counts.get('Invalid / Syntax Error', 0)
+  )
+  inv_col2.metric('Invalid / No MX', counts.get('Invalid / No MX', 0))
+  inv_col3.metric('Disposable / Burner', counts.get('Disposable / Burner', 0))
 
-    if exclude_gateways:
-      g_df = df[
-          (df['Provider'] == 'Google Workspace')
-          & (df['Security_Gateway'] == 'None')
-      ]
-      m_df = df[
-          (df['Provider'] == 'Microsoft 365')
-          & (df['Security_Gateway'] == 'None')
-      ]
-    else:
-      g_df = df[df['Provider'] == 'Google Workspace']
-      m_df = df[df['Provider'] == 'Microsoft 365']
+  st.subheader('Download Your Segmented Lists')
+  exclude_gateways = st.checkbox(
+      'Exclude Mimecast / Proofpoint / Barracuda leads from Google & Microsoft'
+      ' download files',
+      value=False,
+  )
 
-    p_df = df[df['Provider'] == 'Personal / Free Email']
-    o_df = df[df['Provider'] == 'Other']
-    invalid_df = df[
-        df['Provider'].isin(
-            ['Invalid / Syntax Error', 'Invalid / No MX', 'Disposable / Burner']
-        )
+  if exclude_gateways:
+    g_df = df[
+        (df['Provider'] == 'Google Workspace')
+        & (df['Security_Gateway'] == 'None')
     ]
+    m_df = df[
+        (df['Provider'] == 'Microsoft 365')
+        & (df['Security_Gateway'] == 'None')
+    ]
+  else:
+    g_df = df[df['Provider'] == 'Google Workspace']
+    m_df = df[df['Provider'] == 'Microsoft 365']
 
-    with d_col1:
-      st.download_button(
-          '⬇️ All Rows',
-          df.to_csv(index=False).encode('utf-8'),
-          'all_processed_leads.csv',
-          'text/csv',
+  p_df = df[df['Provider'] == 'Personal / Free Email']
+  o_df = df[df['Provider'] == 'Other']
+  invalid_df = df[
+      df['Provider'].isin(
+          ['Invalid / Syntax Error', 'Invalid / No MX', 'Disposable / Burner']
       )
-    with d_col2:
-      st.download_button(
-          f'⬇️ Google ({len(g_df)})',
-          g_df.to_csv(index=False).encode('utf-8'),
-          'google_b2b_leads.csv',
-          'text/csv',
-      )
-    with d_col3:
-      st.download_button(
-          f'⬇️ Microsoft ({len(m_df)})',
-          m_df.to_csv(index=False).encode('utf-8'),
-          'microsoft_b2b_leads.csv',
-          'text/csv',
-      )
-    with d_col4:
-      st.download_button(
-          f'⬇️ Personal ({len(p_df)})',
-          p_df.to_csv(index=False).encode('utf-8'),
-          'personal_email_leads.csv',
-          'text/csv',
-      )
-    with d_col5:
-      st.download_button(
-          f'⬇️ Other ({len(o_df)})',
-          o_df.to_csv(index=False).encode('utf-8'),
-          'other_b2b_leads.csv',
-          'text/csv',
-      )
-    with d_col6:
-      st.download_button(
-          f'⬇️ Invalid/Syntax ({len(invalid_df)})',
-          invalid_df.to_csv(index=False).encode('utf-8'),
-          'invalid_and_syntax_errors.csv',
-          'text/csv',
-      )
+  ]
 
-    # Interactive Preview Tabs
-    st.subheader('Data Preview')
-    tab1, tab2 = st.tabs([
-        f'All Leads ({len(df)})',
-        f'⚠️ Invalid & Syntax Errors ({len(invalid_df)})',
-    ])
-    with tab1:
-      st.dataframe(df.head(50), use_container_width=True)
-    with tab2:
-      if len(invalid_df) > 0:
-        st.dataframe(invalid_df, use_container_width=True)
-      else:
-        st.info('No invalid or syntax errors found in this list!')
+  d_col1, d_col2, d_col3, d_col4, d_col5, d_col6 = st.columns(6)
+
+  with d_col1:
+    st.download_button(
+        '⬇️ All Rows',
+        df.to_csv(index=False).encode('utf-8'),
+        'all_processed_leads.csv',
+        'text/csv',
+        key='dl_all',
+    )
+  with d_col2:
+    st.download_button(
+        f'⬇️ Google ({len(g_df)})',
+        g_df.to_csv(index=False).encode('utf-8'),
+        'google_b2b_leads.csv',
+        'text/csv',
+        key='dl_google',
+    )
+  with d_col3:
+    st.download_button(
+        f'⬇️ Microsoft ({len(m_df)})',
+        m_df.to_csv(index=False).encode('utf-8'),
+        'microsoft_b2b_leads.csv',
+        'text/csv',
+        key='dl_ms',
+    )
+  with d_col4:
+    st.download_button(
+        f'⬇️ Personal ({len(p_df)})',
+        p_df.to_csv(index=False).encode('utf-8'),
+        'personal_email_leads.csv',
+        'text/csv',
+        key='dl_personal',
+    )
+  with d_col5:
+    st.download_button(
+        f'⬇️ Other ({len(o_df)})',
+        o_df.to_csv(index=False).encode('utf-8'),
+        'other_b2b_leads.csv',
+        'text/csv',
+        key='dl_other',
+    )
+  with d_col6:
+    st.download_button(
+        f'⬇️ Invalid/Syntax ({len(invalid_df)})',
+        invalid_df.to_csv(index=False).encode('utf-8'),
+        'invalid_and_syntax_errors.csv',
+        'text/csv',
+        key='dl_invalid',
+    )
+
+  st.subheader('Data Preview')
+  tab1, tab2 = st.tabs([
+      f'All Leads ({len(df)})',
+      f'⚠️ Invalid & Syntax Errors ({len(invalid_df)})',
+  ])
+  with tab1:
+    st.dataframe(df.head(50), use_container_width=True)
+  with tab2:
+    if len(invalid_df) > 0:
+      st.dataframe(invalid_df, use_container_width=True)
+    else:
+      st.info('No invalid or syntax errors found in this list!')
